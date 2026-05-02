@@ -9,114 +9,118 @@ on:
         default: 'Release'
         type: choice
         options: [Release, Debug]
-      abi_filter:
-        description: 'ABI targets'
-        required: true
-        default: 'arm64-v8a armeabi-v7a x86_64'
   push:
     branches: [main, master]
     paths:
       - '.github/workflows/build-trusttunnel-android.yml'
+      - 'trusttunnel_proxy_jni.cpp'
 
 env:
-  NDK_VERSION: "28.1.13356709"
-  CMAKE_VERSION: "3.31.6"
+  NDK_VERSION:    "28.1.13356709"
+  CMAKE_VERSION:  "3.31.6"
   PYTHON_VERSION: "3.13"
-  # Версия TrustTunnelClient
-  CLIENT_REF: "master"
+  CLIENT_REF:     "master"
 
 jobs:
-  build-android-so:
-    name: Build Android .so (${{ matrix.abi }})
+  build:
+    name: Build .so (${{ matrix.abi }})
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         abi: [arm64-v8a, armeabi-v7a, x86_64]
-        # Исключаем ABI если они не в фильтре
-        # Все три собираются по умолчанию
 
     steps:
-      # ─────────────────────────────────────────────
-      # 1. Checkout репозитория клиента
-      # ─────────────────────────────────────────────
+      # ── 1. Наш враппер (этот репозиторий) ──────────────────────────────
+      - name: Checkout wrapper repo
+        uses: actions/checkout@v4
+        with:
+          path: wrapper
+
+      # ── 2. TrustTunnelClient ────────────────────────────────────────────
       - name: Checkout TrustTunnelClient
         uses: actions/checkout@v4
         with:
           repository: TrustTunnel/TrustTunnelClient
           ref: ${{ env.CLIENT_REF }}
           submodules: recursive
+          path: TrustTunnelClient
 
-      # ─────────────────────────────────────────────
-      # 2. Зависимости системы
-      # ─────────────────────────────────────────────
-      - name: Install system dependencies
+      # ── 3. Копируем наш .cpp в дерево клиента ──────────────────────────
+      - name: Inject proxy wrapper
+        run: |
+          cp wrapper/trusttunnel_proxy_jni.cpp TrustTunnelClient/platform/android/
+
+          # Патчим CMakeLists.txt Android адаптера — добавляем нашу target
+          cat >> TrustTunnelClient/platform/android/CMakeLists.txt << 'CMAKE'
+
+          # ── TrustTunnel Proxy JNI wrapper (для ReMandre/Telegram плагина) ──
+          add_library(trusttunnel_proxy SHARED
+              ${CMAKE_CURRENT_SOURCE_DIR}/trusttunnel_proxy_jni.cpp
+          )
+          target_include_directories(trusttunnel_proxy PRIVATE
+              ${CMAKE_SOURCE_DIR}
+              ${CMAKE_SOURCE_DIR}/core/include
+              ${CMAKE_SOURCE_DIR}/common
+              ${CMAKE_SOURCE_DIR}/net
+              ${CMAKE_SOURCE_DIR}/vpn
+          )
+          target_link_libraries(trusttunnel_proxy
+              vpnlibs_core
+              android
+              log
+          )
+          CMAKE
+          echo "CMakeLists.txt patched"
+
+      # ── 4. Системные зависимости ────────────────────────────────────────
+      - name: Install system deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            ninja-build \
-            clang \
-            libc++-dev \
-            libc++abi-dev \
-            llvm \
-            pkg-config \
-            curl \
-            unzip \
-            git \
-            perl \
-            nasm
+            ninja-build clang libc++-dev libc++abi-dev llvm \
+            pkg-config curl unzip git perl nasm
 
-      # ─────────────────────────────────────────────
-      # 3. Python + зависимости
-      # ─────────────────────────────────────────────
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      # ── 5. Python ───────────────────────────────────────────────────────
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
+          cache: pip
 
       - name: Install Python deps
+        working-directory: TrustTunnelClient
         run: |
-          python3 -m venv env
-          source env/bin/activate
+          python3 -m venv ../env
+          source ../env/bin/activate
           pip install --upgrade pip
-          pip install conan==2.* cmake
+          pip install "conan>=2.0.5" cmake
           pip install -r scripts/requirements.txt || true
-          echo "VIRTUAL_ENV=$VIRTUAL_ENV" >> $GITHUB_ENV
-          echo "PATH=$VIRTUAL_ENV/bin:$PATH" >> $GITHUB_ENV
+          echo "PATH=$(pwd)/../env/bin:$PATH" >> $GITHUB_ENV
 
-      # ─────────────────────────────────────────────
-      # 4. Rust (нужен для sub-crates)
-      # ─────────────────────────────────────────────
-      - name: Install Rust toolchain
+      # ── 6. Rust ─────────────────────────────────────────────────────────
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
 
-      # ─────────────────────────────────────────────
-      # 5. Go (нужен для некоторых зависимостей)
-      # ─────────────────────────────────────────────
+      # ── 7. Go ───────────────────────────────────────────────────────────
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.18.3'
 
-      # ─────────────────────────────────────────────
-      # 6. Android SDK + NDK
-      # ─────────────────────────────────────────────
+      # ── 8. JDK + Android SDK/NDK ────────────────────────────────────────
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
-          distribution: 'temurin'
+          distribution: temurin
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: '11076708'
 
-      - name: Install Android NDK & CMake
+      - name: Install NDK + CMake
         run: |
           sdkmanager --install \
             "ndk;${{ env.NDK_VERSION }}" \
@@ -124,204 +128,168 @@ jobs:
             "platforms;android-35" \
             "build-tools;35.0.0"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
-          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
 
-      # ─────────────────────────────────────────────
-      # 7. Кэш Conan
-      # ─────────────────────────────────────────────
-      - name: Cache Conan packages
+      # ── 9. Кэш Conan ────────────────────────────────────────────────────
+      - name: Cache Conan
         uses: actions/cache@v4
         with:
           path: ~/.conan2
-          key: conan2-android-${{ matrix.abi }}-${{ hashFiles('conanfile.py', 'conandata.yml') }}
-          restore-keys: |
-            conan2-android-${{ matrix.abi }}-
-            conan2-android-
+          key: conan2-${{ matrix.abi }}-${{ hashFiles('TrustTunnelClient/conanfile.py','TrustTunnelClient/conandata.yml') }}
+          restore-keys: conan2-${{ matrix.abi }}-
 
-      # ─────────────────────────────────────────────
-      # 8. Bootstrap Conan зависимостей
-      # ─────────────────────────────────────────────
-      - name: Bootstrap Conan deps
+      # ── 10. Conan profile для Android ───────────────────────────────────
+      - name: Configure Conan profile
+        working-directory: TrustTunnelClient
         run: |
-          source env/bin/activate
+          source ../env/bin/activate
           conan profile detect --force
 
-          # Патчим профиль для Android cross-compile
           ABI="${{ matrix.abi }}"
           case "$ABI" in
-            arm64-v8a)    ANDROID_ARCH="armv8";  RUST_TARGET="aarch64-linux-android"  ;;
-            armeabi-v7a)  ANDROID_ARCH="armv7";  RUST_TARGET="armv7-linux-androideabi" ;;
-            x86_64)       ANDROID_ARCH="x86_64"; RUST_TARGET="x86_64-linux-android"   ;;
+            arm64-v8a)   CONAN_ARCH="armv8"  ;;
+            armeabi-v7a) CONAN_ARCH="armv7"  ;;
+            x86_64)      CONAN_ARCH="x86_64" ;;
           esac
 
-          # Создаём Conan profile для Android
-          cat > ~/.conan2/profiles/android_${ABI} << EOF
+          mkdir -p ~/.conan2/profiles
+          cat > ~/.conan2/profiles/android_${ABI} << PROF
           [settings]
           os=Android
           os.api_level=26
-          arch=${ANDROID_ARCH}
+          arch=${CONAN_ARCH}
           compiler=clang
           compiler.version=17
           compiler.libcxx=libc++
           build_type=${{ github.event.inputs.build_type || 'Release' }}
 
           [conf]
-          tools.android:ndk_path=${{ env.ANDROID_NDK_HOME || '$ANDROID_SDK_ROOT/ndk/28.1.13356709' }}
-          EOF
+          tools.android:ndk_path=$ANDROID_NDK_HOME
+          PROF
 
+      # ── 11. Bootstrap Conan зависимостей ────────────────────────────────
+      - name: Bootstrap Conan deps
+        working-directory: TrustTunnelClient
+        run: |
+          source ../env/bin/activate
           python3 scripts/bootstrap_conan_deps.py \
-            --profile android_${ABI} \
+            --profile android_${{ matrix.abi }} \
             || python3 scripts/bootstrap_conan_deps.py || true
 
-      # ─────────────────────────────────────────────
-      # 9. CMake конфигурация для Android
-      # ─────────────────────────────────────────────
-      - name: Configure CMake for Android (${{ matrix.abi }})
+      # ── 12. CMake configure ─────────────────────────────────────────────
+      - name: CMake configure
+        working-directory: TrustTunnelClient
         run: |
-          source env/bin/activate
-          ABI="${{ matrix.abi }}"
+          source ../env/bin/activate
           BUILD_TYPE="${{ github.event.inputs.build_type || 'Release' }}"
-          NDK="${ANDROID_NDK_HOME:-$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}}"
+          NDK="$ANDROID_NDK_HOME"
           TOOLCHAIN="$NDK/build/cmake/android.toolchain.cmake"
 
-          CMAKE_BINARY=$(which cmake)
-
-          mkdir -p build_android_${ABI}
           cmake \
-            -B build_android_${ABI} \
+            -B build_${{ matrix.abi }} \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
             -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN}" \
-            -DANDROID_ABI=${ABI} \
+            -DANDROID_ABI=${{ matrix.abi }} \
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_shared \
             -DCMAKE_ANDROID_NDK="${NDK}" \
             -DCMAKE_SYSTEM_NAME=Android \
             -DCMAKE_SYSTEM_VERSION=26 \
-            -DBUILD_SHARED_LIBS=ON \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             .
 
-      # ─────────────────────────────────────────────
-      # 10. Сборка
-      # ─────────────────────────────────────────────
-      - name: Build vpnlibs_core (shared)
+      # ── 13. Сборка ──────────────────────────────────────────────────────
+      - name: Build vpnlibs_core + trusttunnel_proxy
+        working-directory: TrustTunnelClient
         run: |
-          source env/bin/activate
-          ABI="${{ matrix.abi }}"
-          # Пробуем собрать основную библиотеку ядра
-          cmake --build build_android_${ABI} \
-            --target vpnlibs_core \
-            --parallel $(nproc) \
-            || cmake --build build_android_${ABI} --parallel $(nproc)
+          source ../env/bin/activate
+          cmake --build build_${{ matrix.abi }} \
+            --target vpnlibs_core trusttunnel_proxy \
+            --parallel $(nproc)
 
-      # ─────────────────────────────────────────────
-      # 11. Альтернативная сборка через Gradle (AAR)
-      #     — если выше не получилось, берём .so из AAR
-      # ─────────────────────────────────────────────
-      - name: Build Android adapter via Gradle (fallback)
-        if: always()
-        working-directory: platform/android
-        run: |
-          source $GITHUB_WORKSPACE/env/bin/activate
-          BUILD_TYPE_LOWER=$(echo "${{ github.event.inputs.build_type || 'Release' }}" | tr '[:upper:]' '[:lower:]')
-
-          CMAKE_DIR=$(dirname $(dirname $(which cmake)))
-          echo "cmake.dir=${CMAKE_DIR}" >> local.properties
-          echo "sdk.dir=$ANDROID_SDK_ROOT"  >> local.properties
-          echo "ndk.dir=$ANDROID_NDK_HOME"  >> local.properties
-
-          ./gradlew assemble${BUILD_TYPE_LOWER^} \
-            -Pandroid.injected.build.abi=${{ matrix.abi }} \
-            --no-daemon \
-            || true
-
-      # ─────────────────────────────────────────────
-      # 12. Найти и собрать артефакты
-      # ─────────────────────────────────────────────
+      # ── 14. Собираем артефакты ──────────────────────────────────────────
       - name: Collect .so files
+        working-directory: TrustTunnelClient
         run: |
           ABI="${{ matrix.abi }}"
-          mkdir -p artifacts/${ABI}
+          mkdir -p ../artifacts/${ABI}
 
-          # Ищем все .so файлы относящиеся к TrustTunnel / vpnlibs
-          find . \( -path "*/build*/*.so" -o -path "*/build_android*/*.so" \) \
+          # Основная цель
+          find build_${ABI} -name "libtrustunnel_proxy.so" \
             ! -path "*/CMakeFiles/*" \
-            ! -path "*/_deps/*" \
-            | grep -v "test" \
-            | sort \
-            | xargs -I{} cp -v {} artifacts/${ABI}/ 2>/dev/null || true
+            -exec cp -v {} ../artifacts/${ABI}/ \;
 
-          # Ищем в AAR если Gradle отработал
-          find . -name "*.aar" | while read aar; do
-            mkdir -p /tmp/aar_extract
-            unzip -o "$aar" "jni/${ABI}/*.so" -d /tmp/aar_extract 2>/dev/null || true
-            find /tmp/aar_extract -name "*.so" -exec cp -v {} artifacts/${ABI}/ \;
-          done
+          # Зависимость (может понадобиться при загрузке через linker)
+          find build_${ABI} -name "libvpnlibs_core.so" \
+            ! -path "*/CMakeFiles/*" \
+            -exec cp -v {} ../artifacts/${ABI}/ \; 2>/dev/null || true
 
-          echo "=== Collected .so files for ${ABI} ==="
-          ls -lh artifacts/${ABI}/ || echo "(none found)"
+          # libc++_shared нужна на старых Android < API 21
+          find "$ANDROID_NDK_HOME" \
+            -path "*/${ABI}/libc++_shared.so" \
+            -exec cp -v {} ../artifacts/${ABI}/ \; 2>/dev/null || true
 
-      - name: Upload artifacts (${{ matrix.abi }})
+          echo "=== ${ABI} ==="
+          ls -lh ../artifacts/${ABI}/
+
+      - name: Upload artifact (${{ matrix.abi }})
         uses: actions/upload-artifact@v4
         with:
-          name: trusttunnel-android-${{ matrix.abi }}-${{ github.event.inputs.build_type || 'Release' }}
+          name: tt-proxy-${{ matrix.abi }}-${{ github.event.inputs.build_type || 'Release' }}
           path: artifacts/${{ matrix.abi }}/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
-  # ─────────────────────────────────────────────────────────────
-  # Финальный job — упаковывает все ABI вместе
-  # ─────────────────────────────────────────────────────────────
-  package-all-abis:
+  # ── Пакуем все ABI в один ZIP ────────────────────────────────────────────
+  package:
     name: Package all ABIs
-    needs: build-android-so
+    needs: build
     runs-on: ubuntu-22.04
-    if: always()
     steps:
-      - name: Download all ABI artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: trusttunnel-android-*
-          path: all_abis
+          pattern: tt-proxy-*
+          path: raw
           merge-multiple: false
 
-      - name: Organize jniLibs structure
+      - name: Build jniLibs structure
         run: |
           mkdir -p jniLibs
 
-          for abi_dir in all_abis/trusttunnel-android-*/; do
-            # Извлекаем ABI из имени директории
-            ABI=$(basename "$abi_dir" | sed 's/trusttunnel-android-//' | sed 's/-Release//' | sed 's/-Debug//')
-            echo "ABI: $ABI  dir: $abi_dir"
-            mkdir -p "jniLibs/${ABI}"
-            find "$abi_dir" -name "*.so" -exec cp -v {} "jniLibs/${ABI}/" \;
+          for dir in raw/tt-proxy-*/; do
+            # tt-proxy-arm64-v8a-Release → arm64-v8a
+            ABI=$(basename "$dir" | sed 's/^tt-proxy-//' | sed 's/-Release$//' | sed 's/-Debug$//')
+            echo "ABI: $ABI"
+            mkdir -p jniLibs/${ABI}
+            find "$dir" -name "*.so" -exec cp -v {} jniLibs/${ABI}/ \;
           done
 
-          echo "=== Final jniLibs structure ==="
+          echo "── jniLibs ──"
           find jniLibs -name "*.so" | sort
 
-      - name: Create ZIP archive
+      - name: Create ZIP
         run: |
           zip -r trusttunnel-android-jniLibs.zip jniLibs/
-          echo "Archive size: $(du -sh trusttunnel-android-jniLibs.zip | cut -f1)"
+          ls -lh trusttunnel-android-jniLibs.zip
 
-      - name: Upload combined artifact
+      - name: Upload combined
         uses: actions/upload-artifact@v4
         with:
           name: trusttunnel-android-all-abis
           path: trusttunnel-android-jniLibs.zip
           retention-days: 30
 
-      - name: Summary
+      - name: Job summary
         run: |
-          echo "## 🎉 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Build done ..." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| ABI | .so files |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ABI | Files |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            count=$(find jniLibs/${abi} -name "*.so" 2>/dev/null | wc -l)
-            echo "| ${abi} | ${count} |" >> $GITHUB_STEP_SUMMARY
+            n=$(find jniLibs/${abi} -name "*.so" 2>/dev/null | wc -l)
+            echo "| \`${abi}\` | ${n} .so |" >> $GITHUB_STEP_SUMMARY
           done
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Artifact: \`trusttunnel-android-all-abis\` → \`trusttunnel-android-jniLibs.zip\`" >> $GITHUB_STEP_SUMMARY
+          echo "Артефакт: \`trusttunnel-android-all-abis\` → \`trusttunnel-android-jniLibs.zip\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Положи \`libtrustunnel_proxy.so\` в ReMandre под именем \`libtrustunnel_proxy\`" >> $GITHUB_STEP_SUMMARY
